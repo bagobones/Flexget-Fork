@@ -257,16 +257,16 @@ class SeerrEntry:
             log.debug(e)
 
     def mark_deleting(self) -> None:
-        """Mark request for deletion (semi-automatic, needs Radarr/Sonarr)."""
+        """Delete request (removes from Seerr)."""
         if self.status_code == STATUS_DELETED:
             log.verbose(f'{self.seer_title} already deleted in Seerr.')
             return
-        log.info('Marking {} as deleting in Seerr.', self.seer_title)
+        log.info('Deleting {} in Seerr.', self.seer_title)
         try:
-            self._request.post(f'/request/{self.request_id}/deleting')
-            log.info('{} has been marked deleting.', self.seer_title)
+            self._request.delete(f'/request/{self.request_id}')
+            log.info('{} has been deleted from Seerr.', self.seer_title)
         except (HTTPError, ApiError) as e:
-            log.error('Failed to mark {} as deleting in Seerr.', self.seer_title)
+            log.error('Failed to delete {} from Seerr.', self.seer_title)
             log.debug(e)
 
     def mark_declined(self) -> None:
