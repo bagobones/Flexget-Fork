@@ -20,10 +20,22 @@ if TYPE_CHECKING:
 
 log = logger.bind(name='seer_list')
 
-# Type hinting for request type
 SUPPORTED_IDS: list[Literal['tmdb_id', 'imdb_id', 'tvdb_id', 'seer_id']] = ['tmdb_id', 'imdb_id', 'tvdb_id', 'seer_id']
 
-REQUEST_STATUS = Literal['pending', 'approved', 'available', 'declined', 'deleting']
+# Seerr status codes
+STATUS_PENDING = 1
+STATUS_APPROVED = 2
+STATUS_AVAILABLE = 3
+STATUS_DECLINING = 4
+STATUS_DELETED = 5
+
+STATUS_TEXT = {
+    STATUS_PENDING: 'pending',
+    STATUS_APPROVED: 'approved',
+    STATUS_AVAILABLE: 'available',
+    STATUS_DECLINING: 'declining',
+    STATUS_DELETED: 'deleted',
+}
 
 
 class ApiError(Exception):
@@ -31,7 +43,7 @@ class ApiError(Exception):
 
     def __init__(self, response: dict[str, Any]) -> None:
         self.response = response
-        super().__init__(self.response.get('message', response.get('error', 'API Error')))
+        super().__init__(response.get('message', response.get('error', 'API Error')))
 
 
 class Config(TypedDict):
@@ -39,7 +51,7 @@ class Config(TypedDict):
 
     url: str
     api_key: NotRequired[str]
-    username: NotRequired[str]
+    email: NotRequired[str]
     password: NotRequired[str]
     type: Literal['shows', 'seasons', 'episodes', 'movies']
     status: Literal['approved', 'pending', 'available', 'all']
@@ -50,40 +62,58 @@ class Config(TypedDict):
 
 
 class SeerrRequest:
-    """HTTP client for the Seerr API."""
+    """HTTP client for the Seerr API.
+
+    Seerr uses cookie-based authentication (not Bearer tokens).
+    - API key mode: uses X-Api-Key header
+    - Cookie mode: POST /auth/local with {email, password}, then uses session cookie
+    """
 
     def __init__(self, config: Config) -> None:
         self.base_url = config['url'].rstrip('/')
         self.config: Config = config
-        self.auth_header = self._create_auth_header()
+        self.cookie_handler = None
+        self._auth_mode = None
+        self._auth_headers = {}
 
-    def _create_auth_header(self) -> dict[str, str]:
-        """Create authentication headers based on config."""
         if 'api_key' in self.config:
-            log.debug('Authenticating via api_key')
-            api_key = self.config['api_key']
-            return {'X-Api-Key': api_key}
+            self._auth_mode = 'api_key'
+            self._auth_headers = {'X-Api-Key': self.config['api_key']}
+        elif self.config.get('email') and self.config.get('password'):
+            self._auth_mode = 'cookie'
+            self._authenticate()
+        else:
+            raise plugin.PluginError('Error: an api_key or email and password must be configured')
 
-        if self.config.get('username') and self.config.get('password'):
-            log.debug('Authenticating via username/password')
-            access_token = self._get_access_token()
-            return {'Authorization': f'Bearer {access_token}'}
-
-        raise plugin.PluginError('Error: an api_key or username and password must be configured')
-
-    def _get_access_token(self) -> str:
-        """Get access token via username/password login."""
-        endpoint = '/auth/local'
-        data = {
-            'username': self.config.get('username'),
+    def _authenticate(self) -> None:
+        """Authenticate via email/password to get session cookie."""
+        login_data = {
+            'email': self.config.get('email'),
             'password': self.config.get('password'),
         }
         headers = self.create_json_headers()
+
         try:
-            response = self._request('post', endpoint, data=data, headers=headers)
-            return response.get('token', response.get('accessToken', ''))
-        except (HTTPError, RequestException, ValueError) as e:
-            raise plugin.PluginError('Seerr username and password login failed') from e
+            # Use the requests module directly since it handles cookies automatically
+            resp = requests.post(
+                self.base_url + '/auth/local',
+                json=login_data,
+                headers=headers,
+                raise_status=False,
+            )
+
+            if resp.status_code != 200:
+                log.error('Login failed with status %d: %s', resp.status_code, resp.text[:200])
+                raise plugin.PluginError('Seerr email/password login failed')
+
+            resp.raise_for_status()
+            # Response body is user info (no token), but cookies are set automatically
+            log.debug('Authenticated as user via cookie session')
+
+        except RequestException as e:
+            raise plugin.PluginError('Seerr login request failed') from e
+        except HTTPError as e:
+            raise plugin.PluginError('Seerr login HTTP error') from e
 
     def _request(self, method: str, endpoint: str, **params: Any) -> dict[str, Any]:
         """Make an HTTP request to the Seerr API."""
@@ -91,30 +121,31 @@ class SeerrRequest:
             endpoint = '/' + endpoint
 
         url = self.base_url + endpoint
-
         headers: dict[str, str] = params.pop('headers', {})
+
+        # Apply auth headers/cookies
+        if self._auth_mode == 'api_key':
+            headers.update(self._auth_headers.copy())
+        # Cookie auth is handled automatically by the requests module
+
         data = params.pop('data', None)
 
-        # Add auth header
-        headers.update(self.auth_header.copy())
-
-        response = requests.request(
+        resp = requests.request(
             method, url, params=params, headers=headers, raise_status=False, json=data
         )
 
         result = {}
-
-        # Parse JSON response
-        if 'application/json' in response.headers.get('Content-Type', ''):
+        content_type = resp.headers.get('Content-Type', '')
+        if 'application/json' in content_type:
             try:
-                result = response.json()
+                result = resp.json()
             except ValueError:
                 result = {}
 
         try:
-            response.raise_for_status()
+            resp.raise_for_status()
         except HTTPError as e:
-            log.debug('API error: %s - %s', e, result)
+            log.debug('API error %d: %s', e, result)
             raise
 
         return result
@@ -142,130 +173,123 @@ class SeerrRequest:
 
 
 class SeerrEntry:
-    """Represents a generic entry returned from the Seerr API."""
+    """Represents a generic entry from the Seerr API (a request object).
 
-    def __init__(self, request_client: SeerrRequest, entry_type: str, data: dict[str, Any]) -> None:
+    Seerr stores media details nested under 'media', and request metadata
+    at the top level. Status is an integer:
+        1=pending, 2=approved, 3=available, 4=declining, 5=deleted
+    """
+
+    def __init__(self, request_client: SeerrRequest, data: dict[str, Any]) -> None:
         self._request = request_client
-        self.entry_type = entry_type
         self.data = data
-        self.seer_title: str = data.get('media', {}).get('title', 'Unknown')
+        media = data.get('media', {})
+        self.seer_title: str = media.get('title', 'Unknown')
+        self.entry_type = media.get('mediaType', 'movie')
 
-        # Handle season/episode suffix
+        # Add season/episode suffix for TV
         if data.get('season'):
-            self.seer_title = self.seer_title + ' S' + str(data['season']).zfill(2)
+            self.seer_title += ' S' + str(data['season']).zfill(2)
         if data.get('episode'):
-            self.seer_title = self.seer_title + ' E' + str(data['episode']).zfill(2)
+            self.seer_title += ' E' + str(data['episode']).zfill(2)
 
     @property
     def request_id(self) -> str:
-        """Get the request ID from the entry."""
+        """Get the request ID."""
         return str(self.data.get('id', ''))
 
     @request_id.setter
     def request_id(self, value: str) -> None:
-        """Set the request ID."""
         self.data['id'] = value
 
+    @property
+    def status_code(self) -> int:
+        """Get the integer status code."""
+        return self.data.get('status', 0)
+
+    @property
+    def status_text(self) -> str:
+        """Get the status as a text string."""
+        return STATUS_TEXT.get(self.status_code, 'unknown')
+
     def already_requested(self) -> tuple[bool, str]:
-        """Check if an entry in Seerr has already been requested.
+        """Check if already in a terminal state.
 
         Returns:
-            tuple[bool, str]: (is_requested, status_string)
+            (bool, str): (is_terminal, status_text)
         """
-        request_status = self.data.get('requestStatus', '')
-        if request_status in ('approved', 'available', 'pending', 'deleting'):
-            return True, request_status
-
+        if self.status_code in (STATUS_AVAILABLE, STATUS_DELETED, STATUS_DECLINING):
+            return True, self.status_text
+        if self.status_code == STATUS_APPROVED:
+            return True, self.status_text
+        if self.status_code == STATUS_PENDING:
+            return True, self.status_text
         return False, 'unrequested'
 
-    def mark_requested(self, endpoint: str, data: dict[str, Any]) -> bool:
-        """Mark an entry in Seerr as being requested."""
+    def mark_requested(self, data: dict[str, Any]) -> bool:
+        """Create a new request in Seerr.
+
+        Seerr requires: {'mediaId': <id>, 'mediaType': 'movie'|'tv'}
+        """
         log.info('Requesting {} in Seerr.', self.seer_title)
 
-        headers = self._request.create_json_headers()
-
         try:
-            response: dict[str, Any] = self._request.post(
-                endpoint=endpoint, data=data, headers=headers
-            )
+            response = self._request.post('/request', data=data)
             self.request_id = str(response.get('id', ''))
             log.info('{} was requested in Seerr.', self.seer_title)
             return True
-        except (HTTPError, ApiError) as error:
-            if isinstance(error, ApiError):
-                error_msg = error.response.get('message', '').lower()
-                if 'already' in error_msg or 'exists' in error_msg:
-                    log.verbose(f'{self.seer_title} already requested in Seerr.')
-                    return True
-
+        except (HTTPError, ApiError, ValueError) as e:
             log.error('Failed to mark {} as requested in Seerr.', self.seer_title)
-            log.verbose(error.response)
+            log.verbose(str(e))
             return False
-        return True
 
     def mark_available(self) -> None:
-        """Mark an entry in Seerr as available."""
-        if self.data.get('requestStatus') == 'available':
+        """Mark request as available."""
+        if self.status_code == STATUS_AVAILABLE:
             log.verbose(f'{self.seer_title} already available in Seerr.')
             return
-
         log.info('Marking {} as available in Seerr.', self.seer_title)
-
-        api_endpoint = f'/request/{self.request_id}/available'
-
         try:
-            self._request.post(api_endpoint)
+            self._request.post(f'/request/{self.request_id}/available')
             log.info('{} has been marked available.', self.seer_title)
         except (HTTPError, ApiError) as e:
             log.error('Failed to mark {} as available in Seerr.', self.seer_title)
             log.debug(e)
 
     def mark_deleting(self) -> None:
-        """Mark an entry in Seerr as deleting."""
-        if self.data.get('requestStatus') == 'deleting':
-            log.verbose(f'{self.seer_title} already deleting in Seerr.')
+        """Mark request for deletion (semi-automatic, needs Radarr/Sonarr)."""
+        if self.status_code == STATUS_DELETED:
+            log.verbose(f'{self.seer_title} already deleted in Seerr.')
             return
-
         log.info('Marking {} as deleting in Seerr.', self.seer_title)
-
-        api_endpoint = f'/request/{self.request_id}/deleting'
-
         try:
-            self._request.post(api_endpoint)
+            self._request.post(f'/request/{self.request_id}/deleting')
             log.info('{} has been marked deleting.', self.seer_title)
         except (HTTPError, ApiError) as e:
             log.error('Failed to mark {} as deleting in Seerr.', self.seer_title)
             log.debug(e)
 
     def mark_declined(self) -> None:
-        """Mark an entry in Seerr as declined."""
-        if self.data.get('requestStatus') == 'declined':
+        """Decline a request."""
+        if self.status_code == STATUS_DECLINING:
             log.verbose(f'{self.seer_title} already declined in Seerr.')
             return
-
         log.info('Marking {} as declined in Seerr.', self.seer_title)
-
-        api_endpoint = f'/request/{self.request_id}/declined'
-
         try:
-            self._request.post(api_endpoint)
+            self._request.post(f'/request/{self.request_id}/declined')
             log.info('{} has been marked declined.', self.seer_title)
         except (HTTPError, ApiError) as e:
             log.error('Failed to mark {} as declined in Seerr.', self.seer_title)
             log.debug(e)
 
     def mark_pending(self) -> None:
-        """Mark an entry in Seerr as pending (reopen request)."""
-        if self.data.get('requestStatus') == 'pending':
+        """Reopen/pending a request (undo decline/deletion)."""
+        if self.status_code == STATUS_PENDING:
             log.verbose(f'{self.seer_title} already pending in Seerr.')
             return
-
         log.info('Marking {} as pending in Seerr.', self.seer_title)
-
-        api_endpoint = f'/request/{self.request_id}/pending'
-
         try:
-            self._request.post(api_endpoint)
+            self._request.post(f'/request/{self.request_id}/pending')
             log.info('{} has been marked pending.', self.seer_title)
         except (HTTPError, ApiError) as e:
             log.error('Failed to mark {} as pending in Seerr.', self.seer_title)
@@ -273,37 +297,16 @@ class SeerrEntry:
 
 
 class SeerrMovie(SeerrEntry):
-    """Manage a Movie entry in Seerr."""
+    """Manage a movie entry in Seerr."""
 
     entry_type = 'movie'
 
-    def __init__(self, request_client: SeerrRequest, data: dict[str, Any]) -> None:
-        super().__init__(request_client, self.entry_type, data)
-
-    def mark_requested(self) -> bool:
-        """Mark a movie entry in Seerr as requested."""
-        already_requested, status = self.already_requested()
-        if already_requested:
-            log.verbose(
-                f'Not marking {self.seer_title} as requested in Seerr because it is already {status}.'
-            )
-            return True
-
-        api_endpoint = '/request'
-
-        # Seerr uses media.tmdbId for movie requests
-        data = {'mediaId': self.data.get('media', {}).get('id')}
-
-        return super().mark_requested(api_endpoint, data)
-
     @classmethod
     def from_tmdb_id(cls, request_client: SeerrRequest, tmdb_id: str) -> SeerrMovie | None:
-        """Create a Seerr Entry from a TMDB ID."""
+        """Look up a movie by TMDB ID."""
         headers = request_client.create_json_headers()
-        endpoint = f'/search/moviedb/{tmdb_id}'
-
         try:
-            data = request_client.get(endpoint, headers=headers)
+            data = request_client.get(f'/movie/{tmdb_id}', headers=headers)
             return SeerrMovie(request_client, data)
         except (HTTPError, ApiError, KeyError) as e:
             log.error('Failed to get Seerr movie by tmdb_id: {}', tmdb_id)
@@ -312,12 +315,10 @@ class SeerrMovie(SeerrEntry):
 
     @classmethod
     def from_imdb_id(cls, request_client: SeerrRequest, imdb_id: str) -> SeerrMovie | None:
-        """Create a Seerr Entry from an IMDB ID."""
+        """Look up a movie by IMDB ID."""
         headers = request_client.create_json_headers()
-        endpoint = f'/search/imdb/{imdb_id}'
-
         try:
-            data = request_client.get(endpoint, headers=headers)
+            data = request_client.get(f'/search/imdb/{imdb_id}', headers=headers)
             return SeerrMovie(request_client, data)
         except (HTTPError, ApiError, KeyError) as e:
             log.error('Failed to get Seerr movie by imdb_id: {}', imdb_id)
@@ -326,12 +327,11 @@ class SeerrMovie(SeerrEntry):
 
     @classmethod
     def from_id(cls, request_client: SeerrRequest, entry: Entry) -> SeerrMovie | None:
-        """Create a Seerr Entry from a FlexGet entry with an ID."""
+        """Create a SeerrEntry from a FlexGet entry."""
         if entry.get('tmdb_id'):
             return cls.from_tmdb_id(request_client, str(entry['tmdb_id']))
         if entry.get('imdb_id'):
             return cls.from_imdb_id(request_client, str(entry['imdb_id']))
-
         log.error('Entry has no tmdb_id or imdb_id to lookup in Seerr')
         return None
 
@@ -342,26 +342,8 @@ class SeerrTv(SeerrEntry):
     entry_type = 'tv'
 
     def __init__(self, request_client: SeerrRequest, data: dict[str, Any], sub_type: str) -> None:
-        super().__init__(request_client, self.entry_type, data)
+        super().__init__(request_client, data)
         self.sub_type = sub_type
-
-    def mark_requested(self) -> bool:
-        """Mark a TV entry in Seerr as requested."""
-        api_endpoint = '/request'
-
-        payload: dict[str, Any] = {'mediaId': self.data.get('media', {}).get('id')}
-
-        if self.sub_type == 'seasons':
-            payload['seasons'] = [self.data.get('season', 1)]
-        elif self.sub_type == 'episodes':
-            payload['seasons'] = [
-                {
-                    'number': self.data.get('season', 1),
-                    'episodes': [self.data.get('episode', 1)],
-                }
-            ]
-
-        return super().mark_requested(api_endpoint, payload)
 
     @classmethod
     def from_tmdb_id(
@@ -370,17 +352,13 @@ class SeerrTv(SeerrEntry):
         entry: Entry,
         sub_type: Literal['shows', 'seasons', 'episodes'],
     ) -> SeerrTv | None:
-        """Create a Seerr Entry from a TMDB ID."""
+        """Look up a TV show by TMDB ID."""
         headers = request_client.create_json_headers()
-
         if not entry.get('tmdb_id'):
             return None
-
         tmdb_id = str(entry['tmdb_id'])
-        endpoint = f'/search/tvdb/{tmdb_id}'
-
         try:
-            data = request_client.get(endpoint, headers=headers)
+            data = request_client.get(f'/tv/{tmdb_id}', headers=headers)
             entry.update(data)
             return SeerrTv(request_client, entry, sub_type)
         except (HTTPError, ApiError, KeyError) as e:
@@ -390,7 +368,7 @@ class SeerrTv(SeerrEntry):
 
 
 class SeerrSet(MutableSet):
-    """The schema for the Seerr managed list."""
+    """The managed list for Seerr."""
 
     supported_ids = SUPPORTED_IDS
     schema = {
@@ -398,7 +376,7 @@ class SeerrSet(MutableSet):
         'properties': {
             'url': {'type': 'string'},
             'api_key': {'type': 'string'},
-            'username': {'type': 'string'},
+            'email': {'type': 'string'},
             'password': {'type': 'string'},
             'type': {'type': 'string', 'enum': ['shows', 'seasons', 'episodes', 'movies']},
             'status': {
@@ -415,7 +393,7 @@ class SeerrSet(MutableSet):
             'include_year': {'type': 'boolean', 'default': False},
             'include_ep_title': {'type': 'boolean', 'default': False},
         },
-        'oneOf': [{'required': ['username', 'password']}, {'required': ['api_key']}],
+        'oneOf': [{'required': ['email', 'password']}, {'required': ['api_key']}],
         'required': ['url', 'type'],
         'additionalProperties': False,
     }
@@ -434,167 +412,157 @@ class SeerrSet(MutableSet):
     def __len__(self):
         return len(self.items)
 
+    # -- MutableSet methods -- #
+
     def add(self, entry: Entry) -> None:
-        """Add an entry to Seerr (request it)."""
+        """Add an entry to Seerr (create a new request)."""
         log.info('Adding {} to Seerr as {}.', entry['title'], self.config['status'])
 
-        log.debug('Getting SEERR entry for {}.', entry['title'])
-
         seerr_entry = self._get_seerr_entry(entry)
-
         if not seerr_entry:
             log.error('Failed to find SEERR entry for {}.', entry['title'])
             return
 
-        already_requested, status = seerr_entry.already_requested()
-        if already_requested:
+        already, status = seerr_entry.already_requested()
+        if already:
             log.verbose(
-                f'Not marking {seerr_entry.seer_title} as requested in Seerr because it is already {status}.'
+                'Not marking %s as requested because it is already %s.',
+                seerr_entry.seer_title,
+                status,
             )
             self.invalidate_cache()
             return
 
-        # Mark as requested first
-        seerr_entry.mark_requested()
+        # Build the request payload
+        media = seerr_entry.data.get('media', seerr_entry.data)
+        media_type = media.get('mediaType', self.entry_type_from_config())
 
+        request_data = {
+            'mediaId': media.get('id'),
+            'mediaType': media_type,
+        }
+
+        # Create the request
+        seerr_entry.mark_requested(request_data)
+
+        # Then apply the configured status action
         if self.config['status'] == 'pending':
             self.invalidate_cache()
             return
 
-        # Get the correct method based on config status
-        status_method = f'mark_{self.config["status"]}'
-        mark_method = getattr(seerr_entry, status_method, None)
-
-        if not mark_method:
+        action = f'mark_{self.config["status"]}'
+        method = getattr(seerr_entry, action, None)
+        if not method:
             log.error(
-                'Failed to find correct method to mark {} as {}.',
-                entry['title'],
+                'Cannot find action %s for status %s.',
+                action,
                 self.config['status'],
             )
             return
 
-        mark_method()
-
+        method()
         self.invalidate_cache()
+
+    def discard(self, entry: Entry) -> None:
+        """Remove an entry from Seerr (change status)."""
+        log.info('Removing {} from seer_list.', entry['title'])
+
+        seerr_entry = self._get_seerr_entry(entry)
+        if not seerr_entry:
+            log.error('Failed to find SEERR entry for {}.', entry['title'])
+            return
+
+        on_remove = self.config.get('on_remove', 'deleting')
+        action = f'mark_{on_remove}'
+        method = getattr(seerr_entry, action, None)
+        if not method:
+            log.error(
+                'Cannot find action %s for on_remove %s.',
+                action,
+                on_remove,
+            )
+            return
+
+        method()
+        self.invalidate_cache()
+
+    def __contains__(self, entry) -> bool:
+        return self._find_entry(entry) is not None
 
     def __ior__(self, entries: list[Entry]) -> SeerrSet:
         for entry in entries:
             self.add(entry)
         return self
 
-    def discard(self, entry: Entry) -> None:
-        """Remove an entry from Seerr."""
-        log.info('Removing {} from seer_list.', entry['title'])
-
-        log.debug('Getting SEERR entry for {}.', entry['title'])
-
-        seerr_entry = self._get_seerr_entry(entry)
-
-        if not seerr_entry:
-            log.error('Failed to find SEERR entry for {}.', entry['title'])
-            return
-
-        # Map on_remove config to method names
-        on_remove = self.config.get('on_remove', 'deleting')
-        unmark_method = getattr(seerr_entry, f'mark_{on_remove}', None)
-
-        if not unmark_method:
-            log.error(
-                'Failed to find correct method to mark {} as {}.',
-                entry['title'],
-                on_remove,
-            )
-            return
-
-        unmark_method()
-
-        self.invalidate_cache()
-
     def __isub__(self, entries: list[Entry]) -> SeerrSet:
         for entry in entries:
             self.discard(entry)
         return self
 
-    def _find_entry(self, entry: Entry) -> dict[str, Any] | None:
-        """Find an entry in the Seerr list by matching IDs."""
-        find_method = getattr(self, f'_find_{self.config["type"]}', None)
-
-        if not find_method:
-            raise plugin.PluginError(
-                'Error: Unknown list type {}.'.format(self.config.get('type'))
-            )
-
-        return find_method(entry)
-
-    def __contains__(self, entry) -> bool:
-        return self._find_entry(entry) is not None
+    def get(self, entry: Entry) -> dict[str, Any] | None:
+        return self._find_entry(entry)
 
     def invalidate_cache(self) -> None:
         self._items = None
 
-    def get(self, entry: Entry) -> dict[str, Any] | None:
-        return self._find_entry(entry)
+    # -- Internal methods -- #
 
     @property
     def items(self) -> list[Entry]:
-        """Get the list of items from Seerr, cached."""
+        """Get cached list of Seerr requests as FlexGet Entries."""
         if self._items is not None:
             return self._items
 
-        requested_items = self.get_requested_items()
-
+        raw_items = self.get_requested_items()
         self._items = []
         list_type = self.config['type']
 
         if list_type == 'movies':
-            filtered_items = filter_seerr_items(requested_items, self.config)
-            self._items = [self.generate_movie_entry(item) for item in filtered_items]
-            return self._items
+            filtered = filter_seerr_items(raw_items, self.config)
+            self._items = [self.generate_movie_entry(item) for item in filtered]
 
-        if list_type == 'shows':
-            shows = [self.generate_tv_entry(item, sub_type='shows') for item in requested_items]
-            self._items = shows
-            return self._items
+        elif list_type == 'shows':
+            filtered = filter_seerr_items(raw_items, self.config)
+            self._items = [
+                self.generate_tv_entry(item, sub_type='shows')
+                for item in filtered
+            ]
 
-        if list_type == 'seasons':
-            seasons = []
-            for show in requested_items:
+        elif list_type == 'seasons':
+            filtered = filter_seerr_items(raw_items, self.config)
+            for show in filtered:
                 for season_data in show.get('seasons', []):
-                    season_entry = self.generate_tv_entry(
-                        show, sub_type='seasons', season=season_data
-                    )
-                    if season_entry:
-                        seasons.append(season_entry)
-            self._items = seasons
-            return self._items
+                    entry = self.generate_tv_entry(show, sub_type='seasons', season=season_data)
+                    if entry:
+                        self._items.append(entry)
 
-        if list_type == 'episodes':
-            episodes = []
-            for show in requested_items:
+        elif list_type == 'episodes':
+            filtered = filter_seerr_items(raw_items, self.config)
+            for show in filtered:
                 for season_data in show.get('seasons', []):
                     for episode_data in season_data.get('episodes', []):
-                        ep_entry = self.generate_tv_entry(
+                        entry = self.generate_tv_entry(
                             show, sub_type='episodes', season=season_data, episode=episode_data
                         )
-                        if ep_entry:
-                            episodes.append(ep_entry)
-            # Filter episodes by status
-            filtered_episodes = filter_seerr_items(episodes, self.config)
-            self._items = [ep for ep in filtered_episodes if isinstance(ep, Entry)]
-            return self._items
+                        if entry:
+                            self._items.append(entry)
 
-        raise plugin.PluginError('Error: Unknown list type {}.'.format(self.config.get('type')))
+        return self._items
 
     @property
     def online(self) -> bool:
-        """Seerr is always considered an online plugin."""
         return True
 
-    # -- Find methods -- #
+    def _find_entry(self, entry: Entry) -> dict[str, Any] | None:
+        find_method = getattr(self, f'_find_{self.config["type"]}', None)
+        if not find_method:
+            raise plugin.PluginError(
+                'Unknown list type {}.'.format(self.config.get('type'))
+            )
+        return find_method(entry)
 
     def _find_movies(self, entry: Entry) -> dict[str, Any] | None:
-        """Search for a movie entry by matching IDs."""
-        log.debug('Doing a movie search in Seerr.')
+        """Match a movie entry by its IDs."""
         for item in self.items:
             for id_type in SUPPORTED_IDS:
                 if entry.get(id_type) and item.get(id_type) == entry.get(id_type):
@@ -602,8 +570,7 @@ class SeerrSet(MutableSet):
         return None
 
     def _find_shows(self, entry: Entry) -> dict[str, Any] | None:
-        """Search for a show entry by matching IDs."""
-        log.debug('Doing a show search in Seerr.')
+        """Match a show entry by its IDs."""
         for item in self.items:
             for id_type in SUPPORTED_IDS:
                 if entry.get(id_type) and item.get(id_type) == entry.get(id_type):
@@ -611,8 +578,7 @@ class SeerrSet(MutableSet):
         return None
 
     def _find_seasons(self, entry: Entry) -> dict[str, Any] | None:
-        """Search for a season entry by matching show ID and season number."""
-        log.debug('Doing a season search in Seerr.')
+        """Match a season by show ID + season number."""
         for item in self.items:
             for id_type in SUPPORTED_IDS:
                 if (
@@ -624,8 +590,7 @@ class SeerrSet(MutableSet):
         return None
 
     def _find_episodes(self, entry: Entry) -> dict[str, Any] | None:
-        """Search for an episode entry by matching show ID, season, and episode."""
-        log.debug('Doing an episode search in Seerr.')
+        """Match an episode by show ID + season + episode."""
         for item in self.items:
             for id_type in SUPPORTED_IDS:
                 if (
@@ -638,7 +603,7 @@ class SeerrSet(MutableSet):
         return None
 
     def _get_seerr_entry(self, entry: Entry) -> SeerrMovie | SeerrTv | None:
-        """Get a Seerr entry object from a FlexGet entry."""
+        """Get a SeerrEntry from a FlexGet entry by looking up its IDs."""
         entry_type = self.config['type']
         request_client = SeerrRequest(self.config)
 
@@ -646,71 +611,77 @@ class SeerrSet(MutableSet):
             return SeerrMovie.from_id(request_client, entry)
         return SeerrTv.from_tmdb_id(request_client, entry, entry_type)
 
-    # -- Helper methods -- #
+    def entry_type_from_config(self) -> str:
+        """Map config type to Seerr mediaType string."""
+        mapping = {
+            'movies': 'movie',
+            'shows': 'tv',
+            'seasons': 'tv',
+            'episodes': 'tv',
+        }
+        return mapping.get(self.config['type'], 'movie')
 
     def generate_series_id(self, season: dict, episode: dict | None = None) -> str:
-        """Generate a series ID string like S01E02."""
-        tempid = 'S' + str(season.get('number', season.get('seasonNumber', 1))).zfill(2)
+        """Generate a series ID like S01E02."""
+        num = season.get('seasonNumber', season.get('number', 1))
+        tempid = 'S' + str(num).zfill(2)
         if episode:
-            tempid = tempid + 'E' + str(episode.get('number', episode.get('episodeNumber', 1))).zfill(2)
+            enum = episode.get('episodeNumber', episode.get('number', 1))
+            tempid += 'E' + str(enum).zfill(2)
         return tempid
 
-    def generate_title(self, item: dict, season: dict | None = None, episode: dict | None = None) -> str:
-        """Generate a display title for an entry."""
+    def generate_title(
+        self, item: dict, season: dict | None = None, episode: dict | None = None
+    ) -> str:
+        """Build a display title for the entry."""
         media = item.get('media', item)
-        temptitle = media.get('title', 'Unknown')
+        title = media.get('title', 'Unknown')
 
-        # Add year if requested
+        # Add year
         release_date = media.get('releaseDate', media.get('release_date', ''))
         if release_date and self.config.get('include_year'):
             try:
-                temptitle = f'{temptitle} ({release_date[:4]})'
+                title = f'{title} ({release_date[:4]})'
             except (TypeError, IndexError):
                 pass
 
-        # Add season/episode info
+        # Add season/episode
         if season or episode:
-            temptitle += ' ' + self.generate_series_id(season, episode)
+            title += ' ' + self.generate_series_id(season if season else {})
             if episode and episode.get('title') and self.config.get('include_ep_title'):
-                temptitle += ' ' + episode['title']
+                title += ' ' + episode['title']
 
-        return temptitle
+        return title
 
     def get_requested_items(self) -> list[dict[str, Any]]:
-        """Get all requested items from Seerr."""
-        request_client = SeerrRequest(self.config)
-        log.debug('Connecting to Seerr to retrieve list of requests.')
+        """Fetch all requests from Seerr."""
+        client = SeerrRequest(self.config)
+        log.debug('Connecting to Seerr to retrieve requests.')
 
         try:
-            headers = request_client.create_json_headers()
-            response = request_client.get('/request', headers=headers)
+            headers = client.create_json_headers()
+            response = client.get('/request', headers=headers)
 
-            # Seerr returns a paginated response - handle both formats
             if isinstance(response, dict) and 'results' in response:
-                items = response['results']
-            elif isinstance(response, list):
-                items = response
-            else:
-                log.warning('Unexpected response format from Seerr: %s', type(response))
-                return []
-
-            return items
-        except (HTTPError, ApiError) as error:
-            raise plugin.PluginError('Error retrieving list of requests from Seerr') from error
+                return response['results']
+            if isinstance(response, list):
+                return response
+            log.warning('Unexpected Seerr response format: %s', type(response))
+            return []
+        except (HTTPError, ApiError) as e:
+            raise plugin.PluginError('Error retrieving requests from Seerr') from e
 
     def generate_movie_entry(self, parent_request: dict[str, Any]) -> Entry:
-        """Generate a FlexGet Entry from a Seerr movie request."""
+        """Convert a Seerr request object to a FlexGet Entry for movies."""
         media = parent_request.get('media', {})
         release_date = media.get('releaseDate', media.get('release_date', ''))
         movie_year = int(release_date[:4]) if release_date else 0
 
-        imdb_id = media.get('imdbId', media.get('imdb_id', ''))
-        tmdb_id = media.get('tmdbId', media.get('tmdb_id', ''))
-        tvdb_id = media.get('tvdbId', media.get('tvdb_id', ''))
+        tmdb_id = str(media.get('tmdbId', '')) or None
+        imdb_id = str(media.get('imdbId', '')) or None
+        tvdb_id = str(media.get('tvdbId', '')) or None
 
-        # Build IMDb URL
         url = f'http://www.imdb.com/title/{imdb_id}/' if imdb_id else ''
-
         title = self.generate_title(parent_request)
 
         return Entry(
@@ -723,15 +694,22 @@ class SeerrSet(MutableSet):
             movie_name=media.get('title', ''),
             movie_year=movie_year,
             seer_request_id=str(parent_request.get('id', '')),
-            seer_status=parent_request.get('requestStatus', ''),
-            seer_approved=parent_request.get('requestStatus') == 'approved',
-            seer_available=parent_request.get('requestStatus') == 'available',
-            seer_pending=parent_request.get('requestStatus') == 'pending',
-            seer_declined=parent_request.get('requestStatus') == 'declined',
+            seer_status=parent_request.get('status'),
+            seer_status_text=STATUS_TEXT.get(parent_request.get('status'), 'unknown'),
             seer_type='movie',
             seer_poster_path=media.get('posterPath', media.get('poster_path', '')),
             seer_backdrop_path=media.get('backdropPath', media.get('backdrop_path', '')),
             seer_media_id=str(media.get('id', '')),
+            seer_approved=(parent_request.get('status') == STATUS_APPROVED),
+            seer_available=(parent_request.get('status') == STATUS_AVAILABLE),
+            seer_pending=(parent_request.get('status') == STATUS_PENDING),
+            seer_declined=(parent_request.get('status') in (STATUS_DECLINING, STATUS_DELETED)),
+            # Additional Seerr-specific fields
+            seer_rating_key=media.get('ratingKey', ''),
+            seer_media_url=media.get('mediaUrl', ''),
+            seer_external_service_id=str(media.get('externalServiceId', '')) or None,
+            seer_created_at=parent_request.get('createdAt', ''),
+            seer_updated_at=parent_request.get('updatedAt', ''),
         )
 
     def generate_tv_entry(
@@ -741,20 +719,20 @@ class SeerrSet(MutableSet):
         season: dict | None = None,
         episode: dict | None = None,
     ) -> Entry | None:
-        """Generate a FlexGet Entry from a Seerr TV request."""
+        """Convert a Seerr request to a FlexGet Entry for TV."""
         media = parent_request.get('media', parent_request)
         release_date = media.get('releaseDate', media.get('release_date', ''))
         tv_year = int(release_date[:4]) if release_date else 0
 
-        imdb_id = media.get('imdbId', media.get('imdb_id', ''))
-        tmdb_id = media.get('tmdbId', media.get('tvdbId', media.get('tmdb_id', '')))
-        tvdb_id = media.get('tvdbId', media.get('tvdb_id', ''))
+        tmdb_id = str(media.get('tmdbId', '')) or None
+        imdb_id = str(media.get('imdbId', '')) or None
+        tvdb_id = str(media.get('tvdbId', '')) or None
 
         url = f'http://www.imdb.com/title/{imdb_id}/' if imdb_id else ''
         title = self.generate_title(parent_request, season, episode)
         series_name = media.get('title', 'Unknown')
 
-        base_entry = {
+        base = {
             'title': title,
             'url': url,
             'tmdb_id': tmdb_id if tmdb_id else None,
@@ -764,55 +742,56 @@ class SeerrSet(MutableSet):
             'series_name': series_name,
             'movie_year': tv_year,
             'seer_request_id': str(parent_request.get('id', '')),
-            'seer_status': parent_request.get('requestStatus', ''),
+            'seer_status': parent_request.get('status'),
+            'seer_status_text': STATUS_TEXT.get(parent_request.get('status'), 'unknown'),
             'seer_type': 'tv',
             'seer_poster_path': media.get('posterPath', media.get('poster_path', '')),
             'seer_backdrop_path': media.get('backdropPath', media.get('backdrop_path', '')),
             'seer_media_id': str(media.get('id', '')),
+            'seer_approved': parent_request.get('status') == STATUS_APPROVED,
+            'seer_available': parent_request.get('status') == STATUS_AVAILABLE,
+            'seer_pending': parent_request.get('status') == STATUS_PENDING,
+            'seer_declined': parent_request.get('status') in (STATUS_DECLINING, STATUS_DELETED),
+            'seer_rating_key': media.get('ratingKey', ''),
+            'seer_media_url': media.get('mediaUrl', ''),
         }
 
         if sub_type == 'shows':
-            return Entry(**{
-                **base_entry,
-                'series_name': title,
-                'seer_show_id': str(media.get('id', '')),
-            })
+            return Entry(**{**base, 'series_name': title})
 
         if sub_type == 'seasons':
-            season_num = season.get('number', season.get('seasonNumber', 1)) if season else 1
+            snum = season.get('seasonNumber', 1) if season else 1
             return Entry(**{
-                **base_entry,
-                'series_name': series_name,
-                'series_season': season_num,
+                **base,
+                'series_season': snum,
                 'series_id': self.generate_series_id(season if season else {}),
-                'tmdb_season': season_num,
+                'tmdb_season': snum,
                 'seer_season_id': str(season.get('id', '')) if season else '',
-                'seer_season': season_num,
+                'seer_season': snum,
             })
 
         if sub_type == 'episodes':
             if not season or not episode:
                 return None
-            season_num = season.get('number', season.get('seasonNumber', 1))
-            episode_num = episode.get('number', episode.get('episodeNumber', 1))
-            ep_title = episode.get('title', '')
-
+            snum = season.get('seasonNumber', 1)
+            enum = episode.get('episodeNumber', 1)
             return Entry(**{
-                **base_entry,
-                'series_name': series_name,
-                'series_season': season_num,
-                'series_episode': episode_num,
+                **base,
+                'series_season': snum,
+                'series_episode': enum,
                 'series_id': self.generate_series_id(season, episode),
-                'tmdb_season': season_num,
-                'tmdb_episode': episode_num,
+                'tmdb_season': snum,
+                'tmdb_episode': enum,
                 'seer_season_id': str(season.get('id', '')),
-                'seer_season': season_num,
+                'seer_season': snum,
                 'seer_episode_id': str(episode.get('id', '')),
-                'seer_episode': episode_num,
-                'seer_episode_title': ep_title,
+                'seer_episode': enum,
+                'seer_episode_title': episode.get('title', ''),
             })
 
-        raise plugin.PluginError('Error: Unknown TV sub-type {}.'.format(sub_type))
+        raise plugin.PluginError(
+            'Unknown TV sub-type {}.'.format(sub_type)
+        )
 
 
 class SeerrList:
@@ -832,38 +811,34 @@ def register_plugin() -> None:
     plugin.register(SeerrList, 'seer_list', api_ver=2, interfaces=['task', 'list'])
 
 
-def filter_seerr_items(items: list[dict[str, Any]], config: Config) -> list[dict[str, Any]]:
-    """Filter Seerr items based on the config.
+def filter_seerr_items(
+    items: list[dict[str, Any]], config: Config
+) -> list[dict[str, Any]]:
+    """Filter Seerr requests based on config.
 
-    Arguments:
-        items: The items returned from the Seerr API.
-        config: The config for the Seerr managed list.
-
-    Returns:
-        list[dict[str, Any]]: The filtered list of items.
+    Seerr uses integer status codes:
+        1=pending, 2=approved, 3=available, 4=declining, 5=deleted
     """
-    filtered_items = items
+    filtered = items
 
     # Hide available items if configured
     if config.get('hide_available', True):
-        filtered_items = [
-            item for item in filtered_items
-            if item.get('requestStatus') != 'available'
+        filtered = [
+            item for item in filtered
+            if item.get('status') != STATUS_AVAILABLE
         ]
 
-    # Filter by status
     status = config.get('status', 'all')
 
     if status == 'all':
-        return filtered_items
-
+        return filtered
     if status == 'approved':
-        return [item for item in filtered_items if item.get('requestStatus') == 'approved']
-
+        return [i for i in filtered if i.get('status') == STATUS_APPROVED]
     if status == 'pending':
-        return [item for item in filtered_items if item.get('requestStatus') == 'pending']
-
+        return [i for i in filtered if i.get('status') == STATUS_PENDING]
     if status == 'available':
-        return [item for item in filtered_items if item.get('requestStatus') == 'available']
+        return [i for i in filtered if i.get('status') == STATUS_AVAILABLE]
 
-    raise plugin.PluginError('Error: Unknown status {}.'.format(status))
+    raise plugin.PluginError(
+        'Error: Unknown status {}.'.format(status)
+    )
